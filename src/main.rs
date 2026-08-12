@@ -139,6 +139,17 @@ enum Command {
     },
     /// Print chassis state every <ms> (default 50) and keep the upload alive.
     Watch { ms: Option<u64> },
+
+    /// Listen only: print every byte received without sending anything.
+    /// Useful to see if the device sends data on its own. Ctrl+C to exit.
+    Listen,
+
+    /// Send a raw hex frame, e.g. `raw "ED DE 07 01 01 D4 01"`.
+    Raw { hex: String },
+
+    /// Try several baud rates: for each, open the port, send the init
+    /// frames and wait briefly for a reply. Ctrl+C to abort.
+    BaudScan,
 }
 
 fn open_transport(cli: &Cli) -> Result<Box<dyn Transport>> {
@@ -178,14 +189,133 @@ fn read_once(chassis: &mut Chassis<Box<dyn Transport>>) -> Result<()> {
     Ok(())
 }
 
+/// Listen-only mode: receive bytes for a while and report statistics.
+fn listen(transport: &mut Box<dyn Transport>) -> Result<()> {
+    println!("listening... Ctrl+C to stop");
+    let mut total = 0usize;
+    let mut packets = 0usize;
+    loop {
+        if STOPPED.load(std::sync::atomic::Ordering::Relaxed) {
+            println!("listen done: {packets} packets, {total} bytes received");
+            return Ok(());
+        }
+        match transport.recv()? {
+            Some(data) => {
+                packets += 1;
+                total += data.len();
+                println!("<<< ({}B) {}", data.len(), hex(&data));
+            }
+            None => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
+    }
+}
+
+/// Send one raw hex frame and report any reply.
+fn raw(transport: &mut Box<dyn Transport>, hex_str: &str) -> Result<()> {
+    let bytes = parse_hex(hex_str).map_err(anyhow::Error::msg)?;
+    println!("sending {} bytes: {}", bytes.len(), hex(&bytes));
+    transport.send(&bytes)?;
+    let mut total = 0usize;
+    let mut packets = 0usize;
+    for _ in 0..20 {
+        match transport.recv()? {
+            Some(data) => {
+                packets += 1;
+                total += data.len();
+                println!("<<< ({}B) {}", data.len(), hex(&data));
+            }
+            None => break,
+        }
+    }
+    println!("received {packets} packets, {total} bytes");
+    Ok(())
+}
+
+/// Try a range of baud rates: open, send init frames, listen briefly.
+fn baud_scan(cli: &Cli) -> Result<()> {
+    use chassis_driver::SerialTransport;
+    const BAUD_RATES: [u32; 7] = [115_200, 57_600, 38_400, 19_200, 9_600, 4_800, 2_400];
+    let rates = BAUD_RATES
+        .iter()
+        .map(|b| b.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    println!("scanning {rates} on {}", cli.serial_port);
+    for baud in BAUD_RATES {
+        if STOPPED.load(std::sync::atomic::Ordering::Relaxed) {
+            break;
+        }
+        print!("baud {baud:>7}: ");
+        let port = match SerialTransport::open(&cli.serial_port, baud) {
+            Ok(p) => p,
+            Err(e) => {
+                println!("open failed: {e}");
+                continue;
+            }
+        };
+        let mut t: Box<dyn Transport> = Box::new(port);
+        if cli.debug {
+            t = Box::new(DebugTransport::new(t));
+        }
+        let init = chassis_driver::frame::frame_enable_states_upload(true);
+        let mut got = Vec::new();
+        for _ in 0..3 {
+            if t.send(&init).is_err() {
+                break;
+            }
+            for _ in 0..10 {
+                if let Some(data) = t.recv()? {
+                    got.extend_from_slice(&data);
+                }
+            }
+        }
+        if got.is_empty() {
+            println!("no reply");
+        } else {
+            println!("reply ({}B): {}", got.len(), hex(&got));
+        }
+    }
+    Ok(())
+}
+
+fn parse_hex(s: &str) -> std::result::Result<Vec<u8>, String> {
+    let cleaned: String = s.chars().filter(|c| !c.is_whitespace()).collect();
+    if !cleaned.len().is_multiple_of(2) {
+        return Err("hex string must have an even number of digits".into());
+    }
+    (0..cleaned.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&cleaned[i..i + 2], 16))
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|e| format!("invalid hex: {e}"))
+}
+
+#[test]
+fn parse_hex_works() {
+    assert_eq!(parse_hex("ED DE 07 01 01 D4 01").unwrap().len(), 7);
+    assert_eq!(parse_hex("EDDE070101D401").unwrap()[0], 0xED);
+    assert!(parse_hex("zz").is_err());
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let transport = open_transport(&cli)?;
-    let transport: Box<dyn Transport> = if cli.debug {
+    let mut transport: Box<dyn Transport> = if cli.debug {
         Box::new(DebugTransport::new(transport))
     } else {
         transport
     };
+
+    // diagnostic commands that work on the raw transport
+    match &cli.command {
+        Some(Command::Listen) => return listen(&mut transport),
+        Some(Command::Raw { hex }) => return raw(&mut transport, hex),
+        Some(Command::BaudScan) => return baud_scan(&cli),
+        _ => {}
+    }
+
     let mut chassis = Chassis::new(transport).with_control_mode(cli.ctrl_mode.into());
 
     if !cli.no_init {
@@ -255,6 +385,8 @@ fn main() -> Result<()> {
             }
             chassis.stop()?;
         }
+        // handled earlier on the raw transport
+        Some(Command::Listen) | Some(Command::Raw { .. }) | Some(Command::BaudScan) => {}
         None => interactive(&mut chassis)?,
     }
     Ok(())
