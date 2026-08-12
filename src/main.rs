@@ -81,9 +81,22 @@ enum Command {
     /// Read one chassis state report and print it.
     Status,
     /// Set velocity: forward <vx> m/s and rotation <wz> rad/s.
-    Vel { vx: f64, wz: f64 },
+    /// Without --duration the process stays alive until Ctrl+C (auto-stop).
+    Vel {
+        vx: f64,
+        wz: f64,
+        /// Auto-stop after this many seconds.
+        #[arg(long)]
+        duration: Option<f64>,
+    },
     /// Set left/right wheel speeds in mm/s directly (mode 2).
-    Vel2 { left: i16, right: i16 },
+    Vel2 {
+        left: i16,
+        right: i16,
+        /// Auto-stop after this many seconds.
+        #[arg(long)]
+        duration: Option<f64>,
+    },
     /// Print chassis state every <ms> (default 50) and keep the upload alive.
     Watch { ms: Option<u64> },
 }
@@ -137,23 +150,80 @@ fn main() -> Result<()> {
     match &cli.command {
         Some(Command::Init) => {}
         Some(Command::Status) => read_once(&mut chassis)?,
-        Some(Command::Vel { vx, wz }) => {
+        Some(Command::Vel { vx, wz, duration }) => {
             chassis.set_velocity(*vx, *wz)?;
             println!("set velocity: vx={vx} m/s, wz={wz} rad/s");
+            // zero velocity means stop: nothing to keep alive
+            if *vx == 0.0 && *wz == 0.0 {
+                return Ok(());
+            }
+            match duration {
+                Some(secs) => {
+                    println!("moving for {secs}s, then auto-stop");
+                    std::thread::sleep(std::time::Duration::from_secs_f64(*secs));
+                    chassis.stop()?;
+                    println!("stopped");
+                }
+                None => {
+                    println!("chassis moving. Press Ctrl+C to stop.");
+                    wait_for_ctrl_c()?;
+                    chassis.stop()?;
+                    println!("stopped");
+                }
+            }
         }
-        Some(Command::Vel2 { left, right }) => {
+        Some(Command::Vel2 {
+            left,
+            right,
+            duration,
+        }) => {
             chassis.set_wheel_speeds_mm_s(*left, *right)?;
             println!("set wheel speeds: L={left} mm/s, R={right} mm/s");
+            if *left == 0 && *right == 0 {
+                return Ok(());
+            }
+            match duration {
+                Some(secs) => {
+                    println!("moving for {secs}s, then auto-stop");
+                    std::thread::sleep(std::time::Duration::from_secs_f64(*secs));
+                    chassis.stop()?;
+                    println!("stopped");
+                }
+                None => {
+                    println!("chassis moving. Press Ctrl+C to stop.");
+                    wait_for_ctrl_c()?;
+                    chassis.stop()?;
+                    println!("stopped");
+                }
+            }
         }
         Some(Command::Watch { ms }) => {
             let interval = ms.unwrap_or(chassis_driver::DEFAULT_TICK_MS);
             loop {
+                if STOPPED.load(std::sync::atomic::Ordering::Relaxed) {
+                    println!("received stop signal, stopping chassis");
+                    break;
+                }
                 chassis.keep_alive()?;
                 read_once(&mut chassis)?;
                 std::thread::sleep(std::time::Duration::from_millis(interval));
             }
+            chassis.stop()?;
         }
         None => interactive(&mut chassis)?,
+    }
+    Ok(())
+}
+
+static STOPPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Install a Ctrl+C handler; when triggered, the main flow stops the chassis.
+fn wait_for_ctrl_c() -> Result<()> {
+    ctrlc::set_handler(move || {
+        STOPPED.store(true, std::sync::atomic::Ordering::Relaxed);
+    })?;
+    while !STOPPED.load(std::sync::atomic::Ordering::Relaxed) {
+        std::thread::sleep(std::time::Duration::from_millis(100));
     }
     Ok(())
 }

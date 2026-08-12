@@ -150,6 +150,14 @@ impl<T: Transport> Chassis<T> {
     }
 }
 
+impl<T: Transport> Drop for Chassis<T> {
+    /// Safety net: send zero velocity when the driver is dropped, so a
+    /// normal (or panicking) exit never leaves the chassis moving.
+    fn drop(&mut self) {
+        let _ = self.stop();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

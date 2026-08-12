@@ -49,6 +49,26 @@ chassis-driver --mode udp watch
 chassis-driver --mode udp
 ```
 
+### Motion control & safety
+
+The chassis keeps moving at the commanded velocity until a new command
+arrives. `vel` / `vel2` therefore either auto-stop after a duration, or keep
+the process alive until Ctrl+C:
+
+```sh
+# move for 2 seconds, then stop automatically
+chassis-driver --mode udp vel 0.2 0.0 --duration 2
+
+# keep moving, stop on Ctrl+C
+chassis-driver --mode udp vel 0.1 0.0
+```
+
+Safety guarantees:
+
+- **Ctrl+C always stops the chassis** (SIGINT handler sends zero velocity).
+- The driver sends zero velocity on `drop` (normal or panicking exit).
+- `vel 0 0` / `vel2 0 0` simply exits without waiting.
+
 ## Protocol
 
 Frame layout (everything little endian):
