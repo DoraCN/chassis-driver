@@ -48,9 +48,49 @@ struct Cli {
     #[arg(long)]
     no_init: bool,
 
+    /// Print every frame sent and received as hex (diagnostics).
+    #[arg(long)]
+    debug: bool,
+
     /// Run `command` once and exit; without it an interactive loop starts.
     #[command(subcommand)]
     command: Option<Command>,
+}
+
+/// Wraps a transport and prints every frame in hex for diagnostics.
+struct DebugTransport<T: Transport> {
+    inner: T,
+}
+
+impl<T: Transport> DebugTransport<T> {
+    fn new(inner: T) -> Self {
+        Self { inner }
+    }
+}
+
+impl<T: Transport> Transport for DebugTransport<T> {
+    fn send(&mut self, frame: &[u8]) -> Result<()> {
+        println!(">>> {}", hex(frame));
+        self.inner.send(frame)
+    }
+
+    fn recv(&mut self) -> Result<Option<Vec<u8>>> {
+        match self.inner.recv()? {
+            Some(data) => {
+                println!("<<< {}", hex(&data));
+                Ok(Some(data))
+            }
+            None => Ok(None),
+        }
+    }
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|b| format!("{b:02X}"))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -141,6 +181,11 @@ fn read_once(chassis: &mut Chassis<Box<dyn Transport>>) -> Result<()> {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let transport = open_transport(&cli)?;
+    let transport: Box<dyn Transport> = if cli.debug {
+        Box::new(DebugTransport::new(transport))
+    } else {
+        transport
+    };
     let mut chassis = Chassis::new(transport).with_control_mode(cli.ctrl_mode.into());
 
     if !cli.no_init {
