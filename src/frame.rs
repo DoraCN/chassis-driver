@@ -1,4 +1,4 @@
-//! Frame building, checksum and state parsing for the ADORA A2 Pro / A2 Max
+//! Frame building, checksum and state parsing for a differential
 //! chassis protocol.
 //!
 //! Frame layout (everything little endian, checksum is a plain u16 sum):
@@ -433,7 +433,7 @@ mod tests {
         frame[1] = (HEADER >> 8) as u8;
         frame[2] = STATE_FRAME_LEN as u8;
         frame[3] = CMD_STATE_FEEDBACK;
-        let mut seal = |frame: &mut Vec<u8>| {
+        let seal = |frame: &mut Vec<u8>| {
             let sum = checksum(&frame[..STATE_FRAME_LEN - 2]);
             frame[24..26].copy_from_slice(&sum.to_le_bytes());
         };

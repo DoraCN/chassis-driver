@@ -1,6 +1,6 @@
-//! Core chassis driver for the ADORA A2 Pro / A2 Max.
+//! Core chassis driver for a differential chassis.
 //!
-//! Behaviour mirrors the reference C++ node (`adora_chassis_a2pro_dora_node.cc`):
+//! Behaviour mirrors the reference C++ driver:
 //!
 //! - mode 1 (velocity, default): `linear.x * 1000` mm/s and
 //!   `angular.z * 1000` (0.001 rad/s) are sent straight to the chassis
@@ -47,7 +47,7 @@ pub enum ControlMode {
     WheelSpeeds = 2,
 }
 
-/// Driver for the ADORA A2 Pro / A2 Max differential chassis.
+/// Driver for a differential chassis.
 pub struct Chassis<T: Transport> {
     transport: T,
     control_mode: ControlMode,
@@ -114,7 +114,7 @@ impl<T: Transport> Chassis<T> {
     /// with speed holding on this chassis.
     pub fn keep_alive(&mut self) -> Result<()> {
         self.ticks = self.ticks.wrapping_add(1);
-        if self.ticks % UPLOAD_REASSERT_TICKS == 0 {
+        if self.ticks.is_multiple_of(UPLOAD_REASSERT_TICKS) {
             self.enable_states_upload(true)?;
         }
         if let Some(frame) = self.last_speed_frame.clone() {

@@ -1,6 +1,6 @@
-//! Command-line interface for the ADORA A2 Pro / A2 Max chassis.
+//! Command-line interface for a differential chassis.
 //!
-//! Standalone replacement for the C++ `adora_chassis_a2pro_dora_node`:
+//! Standalone replacement for the reference C++ driver node:
 //! enables state upload, sends velocity commands and reports feedback.
 
 use std::io::{self, BufRead, Write};
@@ -9,36 +9,23 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 
 use chassis_driver::{
-    Chassis, ControlMode, DEFAULT_SERIAL_BAUD, DEFAULT_SERIAL_PORT, DEFAULT_UDP_IP,
-    DEFAULT_UDP_PORT, SerialTransport, Transport, UdpTransport,
+    Chassis, ControlMode, DEFAULT_SERIAL_BAUD, DEFAULT_SERIAL_PORT, SerialTransport, Transport,
 };
 
 #[derive(Parser, Debug)]
 #[command(
     name = "chassis-driver",
     version,
-    about = "ADORA A2 Pro / A2 Max chassis driver"
+    about = "differential chassis driver"
 )]
 struct Cli {
-    /// Communication mode: serial port or UDP gateway.
-    #[arg(long, value_enum, default_value_t = Mode::Serial)]
-    mode: Mode,
-
-    /// Serial device path (mode=serial).
+    /// Serial device path.
     #[arg(long, default_value = DEFAULT_SERIAL_PORT)]
     serial_port: String,
 
-    /// Serial baud rate (mode=serial).
+    /// Serial baud rate.
     #[arg(long, default_value_t = DEFAULT_SERIAL_BAUD)]
     serial_baud: u32,
-
-    /// UDP target IP (mode=udp).
-    #[arg(long, default_value = DEFAULT_UDP_IP)]
-    udp_ip: String,
-
-    /// UDP local/target port (mode=udp).
-    #[arg(long, default_value_t = DEFAULT_UDP_PORT)]
-    udp_port: u16,
 
     /// Control mode: 1 = velocity (chassis solves wheels), 2 = wheel speeds.
     #[arg(long, value_enum, default_value_t = CtrlMode::Velocity)]
@@ -91,12 +78,6 @@ fn hex(bytes: &[u8]) -> String {
         .map(|b| format!("{b:02X}"))
         .collect::<Vec<_>>()
         .join(" ")
-}
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum Mode {
-    Serial,
-    Udp,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -159,17 +140,10 @@ enum Command {
 }
 
 fn open_transport(cli: &Cli) -> Result<Box<dyn Transport>> {
-    match cli.mode {
-        Mode::Serial => Ok(Box::new(SerialTransport::open(
-            &cli.serial_port,
-            cli.serial_baud,
-        )?)),
-        Mode::Udp => Ok(Box::new(UdpTransport::open(
-            &cli.udp_ip,
-            cli.udp_port,
-            cli.udp_port,
-        )?)),
-    }
+    Ok(Box::new(SerialTransport::open(
+        &cli.serial_port,
+        cli.serial_baud,
+    )?))
 }
 
 fn print_state(state: &chassis_driver::ChassisState) {
@@ -231,10 +205,10 @@ fn read_once(chassis: &mut Chassis<Box<dyn Transport>>) -> Result<()> {
 /// Read one state report and warn if anything would block motion (e-stop,
 /// bumper, driver fault). Does not fail the move — the chassis decides.
 fn warn_if_blocked(chassis: &mut Chassis<Box<dyn Transport>>) -> Result<()> {
-    if let Some(state) = chassis.poll_state()? {
-        if state.emergency_stop() || state.bumper_triggered() || state.driver_fault() {
-            print_state(&state);
-        }
+    if let Some(state) = chassis.poll_state()?
+        && (state.emergency_stop() || state.bumper_triggered() || state.driver_fault())
+    {
+        print_state(&state);
     }
     Ok(())
 }

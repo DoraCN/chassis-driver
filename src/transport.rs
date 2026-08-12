@@ -1,4 +1,4 @@
-//! Transport layer for the ADORA A2 Pro / A2 Max chassis: serial or UDP.
+//! Transport layer for a differential chassis: serial or UDP.
 //!
 //! Mirrors the reference C++ driver: serial on `/dev/ttyACM0` @ 115200 baud
 //! (8N1) or a UDP socket bound to the local port `1231` sending to

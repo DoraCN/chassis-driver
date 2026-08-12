@@ -2,7 +2,7 @@
 name = "chassis-driver"
 version = "0.1.0"
 edition = "2024"
-description = "Driver for the ADORA A2 Pro / A2 Max differential chassis over serial or UDP"
+description = "Driver for a differential chassis over serial"
 license = "MIT"
 repository = "https://github.com/DoraCN/chassis-driver"
 keywords = ["chassis", "differential", "motor", "adora", "robot"]
