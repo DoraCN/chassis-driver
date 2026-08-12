@@ -339,12 +339,7 @@ fn main() -> Result<()> {
                     chassis.stop()?;
                     println!("stopped");
                 }
-                None => {
-                    println!("chassis moving. Press Ctrl+C to stop.");
-                    wait_for_ctrl_c()?;
-                    chassis.stop()?;
-                    println!("stopped");
-                }
+                None => keep_moving_until_ctrl_c(&mut chassis)?,
             }
         }
         Some(Command::Vel2 {
@@ -364,12 +359,7 @@ fn main() -> Result<()> {
                     chassis.stop()?;
                     println!("stopped");
                 }
-                None => {
-                    println!("chassis moving. Press Ctrl+C to stop.");
-                    wait_for_ctrl_c()?;
-                    chassis.stop()?;
-                    println!("stopped");
-                }
+                None => keep_moving_until_ctrl_c(&mut chassis)?,
             }
         }
         Some(Command::Watch { ms }) => {
@@ -395,13 +385,26 @@ fn main() -> Result<()> {
 static STOPPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Install a Ctrl+C handler; when triggered, the main flow stops the chassis.
-fn wait_for_ctrl_c() -> Result<()> {
+fn install_ctrl_c_handler() -> Result<()> {
     ctrlc::set_handler(move || {
         STOPPED.store(true, std::sync::atomic::Ordering::Relaxed);
-    })?;
+    })
+    .context("failed to install Ctrl+C handler")
+}
+
+/// Keep the chassis moving until Ctrl+C: the chassis zeroes the speed
+/// [`chassis_driver::SPEED_TIMEOUT_MS`] ms after the last speed frame
+/// (protocol §3.6), so the current speed command is re-asserted on every
+/// tick.
+fn keep_moving_until_ctrl_c(chassis: &mut Chassis<Box<dyn Transport>>) -> Result<()> {
+    println!("chassis moving. Press Ctrl+C to stop.");
+    install_ctrl_c_handler()?;
     while !STOPPED.load(std::sync::atomic::Ordering::Relaxed) {
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        chassis.keep_alive()?;
+        std::thread::sleep(std::time::Duration::from_millis(chassis_driver::DEFAULT_TICK_MS));
     }
+    chassis.stop()?;
+    println!("stopped");
     Ok(())
 }
 

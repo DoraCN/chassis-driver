@@ -21,8 +21,8 @@ pub const CMD_CONTROL_VELOCITY: u8 = 0x20;
 /// Cmd: left/right wheel speed control (mm/s).
 pub const CMD_CONTROL_WHEEL_SPEEDS: u8 = 0x21;
 
-/// Cmd: stop (defined by the original firmware, currently unused).
-pub const CMD_STOP: u8 = 0x22;
+/// Cmd: emergency stop enable/disable (`0x22`, protocol §4.13.1).
+pub const CMD_EMERGENCY_STOP: u8 = 0x22;
 
 /// Cmd: chassis state feedback frame.
 pub const CMD_STATE_FEEDBACK: u8 = 0x80;
@@ -83,14 +83,14 @@ pub fn frame_control_wheel_speeds(left_mm_s: i16, right_mm_s: i16) -> Vec<u8> {
     with_checksum(frame)
 }
 
-/// Cmd `0x22`: stop command frame (kept for completeness, unused by the
-/// original firmware flow).
-pub fn frame_stop(enable: bool) -> Vec<u8> {
+/// Cmd `0x22`: enable (true) or cancel (false) the emergency stop
+/// (protocol §4.13.1).
+pub fn frame_emergency_stop(enable: bool) -> Vec<u8> {
     with_checksum(vec![
         HEADER as u8,
         (HEADER >> 8) as u8,
         0x07,
-        CMD_STOP,
+        CMD_EMERGENCY_STOP,
         enable as u8,
     ])
 }
@@ -98,15 +98,15 @@ pub fn frame_stop(enable: bool) -> Vec<u8> {
 /// Chassis state decoded from a `0x80` feedback frame.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChassisState {
-    /// Current control mode (1 = velocity, 2 = wheel speeds).
+    /// Current control mode (0 = idle, 1 = remote, 2 = serial, 3 = external).
     pub control_mode: u8,
     /// Battery percentage, 0-100%.
     pub battery_percentage: u8,
-    /// Battery voltage in 0.1 V units (big endian in frame).
+    /// Battery voltage in 0.1 V units (little endian in frame, per §3.2).
     pub voltage_tenths: u16,
-    /// Flags word.
+    /// Flags word (e-stop buttons, bumpers, charging, ...).
     pub flags: u16,
-    /// Error flags word.
+    /// Error flags word (driver offline / alarm).
     pub error_flags: u16,
     /// Measured linear velocity, mm/s.
     pub vx_mm_s: i16,
@@ -120,19 +120,32 @@ pub struct ChassisState {
 
 /// Check whether `frame` looks like a chassis state feedback frame.
 ///
-/// Requires the frame header, `Cmd == 0x80` and the expected length.
+/// Requires the frame header, the length byte `0x1A`, `Cmd == 0x80` and a
+/// valid trailing checksum (protocol §3.5).
 pub fn is_state_frame(frame: &[u8]) -> bool {
     frame.len() == STATE_FRAME_LEN
         && frame[0] == HEADER as u8
         && frame[1] == (HEADER >> 8) as u8
+        && frame[2] == STATE_FRAME_LEN as u8
         && frame[3] == CMD_STATE_FEEDBACK
+        && checksum_valid(frame)
+}
+
+/// Verify the little-endian checksum in the last two bytes against the sum
+/// of every other byte (protocol §3.5).
+pub fn checksum_valid(frame: &[u8]) -> bool {
+    frame.len() >= 2 && {
+        let expected = u16::from_le_bytes([frame[frame.len() - 2], frame[frame.len() - 1]]);
+        checksum(&frame[..frame.len() - 2]) == expected
+    }
 }
 
 /// Decode a validated `0x80` state frame.
 ///
-/// Fields `voltage`, `flags` and `error_flags` are big endian in the frame
-/// (this fixes a shift-precedence bug in the reference C++ driver that
-/// parsed them with `data[7] << 8 + data[6]`).
+/// All multi-byte fields are little endian per protocol §3.2; the expression
+/// below fixes a shift-precedence bug in the reference C++ driver that parsed
+/// them with `data[7] << 8 + data[6]` (which evaluates as `data[7] << (8 +
+/// data[6])`).
 pub fn decode_state(frame: &[u8]) -> Option<ChassisState> {
     if !is_state_frame(frame) {
         return None;
@@ -210,8 +223,11 @@ mod tests {
     }
 
     #[test]
-    fn stop_frame_matches_layout() {
-        assert_eq!(hex(&frame_stop(true)), "ED DE 07 22 01 F5 01");
+    fn emergency_stop_frame_matches_layout() {
+        // 急停使能 (protocol example: ED DE 07 22 01 F5 01)
+        assert_eq!(hex(&frame_emergency_stop(true)), "ED DE 07 22 01 F5 01");
+        // 急停取消 (protocol example: ED DE 07 22 00 F4 01)
+        assert_eq!(hex(&frame_emergency_stop(false)), "ED DE 07 22 00 F4 01");
     }
 
     #[test]
@@ -221,13 +237,13 @@ mod tests {
         frame[1] = 0xDE;
         frame[2] = STATE_FRAME_LEN as u8;
         frame[3] = CMD_STATE_FEEDBACK;
-        frame[4] = 1; // control_mode
+        frame[4] = 2; // control_mode: 2 = serial control (protocol §4.1.3)
         frame[5] = 80; // battery %
-        frame[6] = 0x2C; // voltage = 0x012C = 300 -> 30.0 V (BE)
+        frame[6] = 0x2C; // voltage = 0x012C = 300 -> 30.0 V (LE: 2C 01)
         frame[7] = 0x01;
-        frame[8] = 0x00; // flags = 0x0100
+        frame[8] = 0x00; // flags = 0x0100 (LE: 00 01)
         frame[9] = 0x01;
-        frame[10] = 0xAB; // error_flags = 0xCDAB
+        frame[10] = 0xAB; // error_flags = 0xCDAB (LE: AB CD)
         frame[11] = 0xCD;
         frame[12] = 0xE8; // vx = 1000
         frame[13] = 0x03;
@@ -238,9 +254,11 @@ mod tests {
         frame[18] = 0x70; // vr = 112
         frame[19] = 0x00;
         // bytes 20-23 reserved
+        let sum = checksum(&frame[..STATE_FRAME_LEN - 2]);
+        frame[24..26].copy_from_slice(&sum.to_le_bytes());
 
         let state = decode_state(&frame).expect("state frame should decode");
-        assert_eq!(state.control_mode, 1);
+        assert_eq!(state.control_mode, 2);
         assert_eq!(state.battery_percentage, 80);
         assert_eq!(state.voltage_tenths, 300);
         assert_eq!(state.flags, 0x0100);
@@ -252,6 +270,30 @@ mod tests {
 
         assert!(!is_state_frame(&frame[..25]));
         assert!(!is_state_frame(&[0u8; 26]));
+    }
+
+    #[test]
+    fn state_frame_with_bad_checksum_or_length_byte_is_rejected() {
+        let mut good = vec![0u8; STATE_FRAME_LEN];
+        good[0] = 0xED;
+        good[1] = 0xDE;
+        good[2] = STATE_FRAME_LEN as u8;
+        good[3] = CMD_STATE_FEEDBACK;
+        good[5] = 80;
+        let sum = checksum(&good[..STATE_FRAME_LEN - 2]);
+        good[24..26].copy_from_slice(&sum.to_le_bytes());
+        assert!(is_state_frame(&good));
+
+        // corrupt one payload byte -> checksum mismatch
+        let mut bad = good.clone();
+        bad[5] = 81;
+        assert!(!is_state_frame(&bad));
+        assert!(decode_state(&bad).is_none());
+
+        // wrong length byte
+        let mut wrong_len = good.clone();
+        wrong_len[2] = 0x1B;
+        assert!(!is_state_frame(&wrong_len));
     }
 
     #[test]

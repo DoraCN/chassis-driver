@@ -51,15 +51,16 @@ chassis-driver --mode udp
 
 ### Motion control & safety
 
-The chassis keeps moving at the commanded velocity until a new command
-arrives. `vel` / `vel2` therefore either auto-stop after a duration, or keep
-the process alive until Ctrl+C:
+The chassis zeroes the current speed 800 ms after the last speed control
+frame (protocol §3.6), so while moving, the driver re-sends the current
+velocity command on every 50 ms tick. `vel` / `vel2` either auto-stop after
+a duration, or keep the process alive until Ctrl+C:
 
 ```sh
 # move for 2 seconds, then stop automatically
 chassis-driver --mode udp vel 0.2 0.0 --duration 2
 
-# keep moving, stop on Ctrl+C
+# keep moving (speed command re-asserted every 50 ms), stop on Ctrl+C
 chassis-driver --mode udp vel 0.1 0.0
 ```
 
@@ -67,6 +68,8 @@ Safety guarantees:
 
 - **Ctrl+C always stops the chassis** (SIGINT handler sends zero velocity).
 - The driver sends zero velocity on `drop` (normal or panicking exit).
+- The 800 ms speed timeout is an additional fail-safe: a crashed driver can
+  never leave the chassis moving.
 - `vel 0 0` / `vel2 0 0` simply exits without waiting.
 
 ## Protocol
@@ -84,11 +87,14 @@ Frame layout (everything little endian):
 | `0x01` | down | `u8` | enable/disable 20 ms state upload |
 | `0x20` | down | `s16 vx (mm/s), s16 wz (0.001 rad/s)` | velocity control |
 | `0x21` | down | `s16 left (mm/s), s16 right (mm/s)` | wheel speed control |
+| `0x22` | down | `u8` | emergency stop enable/disable |
 | `0x80` | up | 20 B | chassis state (see below) |
 
 State feedback (`0x80`, 26 bytes): `control_mode`, `battery_percentage`,
-`voltage` (0.1 V), `flags`, `error_flags` (big endian in frame), measured
-`vx` (mm/s), `wz` (0.001 rad/s), `left`/`right` wheel speeds (mm/s).
+`voltage` (0.1 V), `flags`, `error_flags`, measured `vx` (mm/s), `wz`
+(0.001 rad/s), `left`/`right` wheel speeds (mm/s). All multi-byte fields are
+little endian (protocol §3.2); received frames are validated against header,
+length byte and checksum (protocol §3.5).
 
 ## Control modes
 
@@ -98,8 +104,9 @@ State feedback (`0x80`, 26 bytes): `control_mode`, `battery_percentage`,
   `vL = vx - ω·B/2`, `vR = vx + ω·B/2` with wheel base `B = 348 mm` and sends
   the result (`0x21`).
 
-The state upload command is re-sent on every tick as a keep-alive; the
-chassis drops the upload when the command is not repeated.
+The state upload command and the current speed command are re-sent on every
+tick as a keep-alive; the chassis drops the upload when the command is not
+repeated, and zeroes the speed 800 ms after the last speed frame (§3.6).
 
 ## Safety
 

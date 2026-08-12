@@ -8,14 +8,16 @@
 //! - mode 2 (wheel speeds): the host solves the differential kinematics
 //!   `vL = vx - ω·B/2`, `vR = vx + ω·B/2` with `B = 348 mm` and sends the
 //!   left/right wheel speeds in mm/s.
-//! - state upload is enabled once on init and re-asserted on every tick
-//!   (keep-alive), matching the reference driver.
+//! - state upload is enabled once on init and re-asserted on every tick,
+//!   matching the reference driver; the last non-zero speed command is
+//!   re-sent on the same tick because the chassis zeroes the speed 800 ms
+//!   after the last speed frame (protocol §3.6).
 
 use anyhow::{Context, Result};
 
 use crate::frame::{
     ChassisState, decode_state, frame_control_velocity, frame_control_wheel_speeds,
-    frame_enable_states_upload,
+    frame_emergency_stop, frame_enable_states_upload,
 };
 use crate::transport::Transport;
 
@@ -24,6 +26,11 @@ pub const BASE_WIDTH_MM: f64 = 348.0;
 
 /// Milliseconds between the reference driver's keep-alive ticks.
 pub const DEFAULT_TICK_MS: u64 = 50;
+
+/// Milliseconds after which the chassis zeroes the current speed when no new
+/// speed control frame arrives (protocol §3.6). The driver must re-send the
+/// last speed command on every tick, well below this limit.
+pub const SPEED_TIMEOUT_MS: u64 = 800;
 
 /// Control mode of the chassis.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -41,6 +48,10 @@ pub struct Chassis<T: Transport> {
     control_mode: ControlMode,
     base_width_mm: f64,
     state: Option<ChassisState>,
+    /// Last non-zero speed command (velocity or wheel speeds), re-sent on
+    /// every [`Self::keep_alive`] tick because the chassis zeroes the speed
+    /// [`SPEED_TIMEOUT_MS`] ms after the last speed frame (§3.6).
+    last_speed_frame: Option<Vec<u8>>,
 }
 
 impl<T: Transport> Chassis<T> {
@@ -51,6 +62,7 @@ impl<T: Transport> Chassis<T> {
             control_mode: ControlMode::default(),
             base_width_mm: BASE_WIDTH_MM,
             state: None,
+            last_speed_frame: None,
         }
     }
 
@@ -87,28 +99,48 @@ impl<T: Transport> Chassis<T> {
         Ok(())
     }
 
-    /// Keep-alive: re-assert state upload (the chassis drops the upload if
-    /// the command is not repeated).
+    /// Keep-alive: re-assert state upload and re-send the last non-zero speed
+    /// command (the chassis drops the upload and zeroes the speed after
+    /// [`SPEED_TIMEOUT_MS`] ms of silence, protocol §3.6).
     pub fn keep_alive(&mut self) -> Result<()> {
-        self.enable_states_upload(true)
+        self.enable_states_upload(true)?;
+        if let Some(frame) = self.last_speed_frame.clone() {
+            self.transport
+                .send(&frame)
+                .context("failed to re-send speed keep-alive")?;
+        }
+        Ok(())
+    }
+
+    /// Enable (true) or cancel (false) the chassis emergency stop
+    /// (protocol §4.13.1, cmd `0x22`).
+    pub fn set_emergency_stop(&mut self, enable: bool) -> Result<()> {
+        self.transport
+            .send(&frame_emergency_stop(enable))
+            .context("failed to send emergency stop frame")
     }
 
     /// Set the chassis velocity directly (`0x20` frame).
     ///
     /// `vx` is linear velocity in m/s, `wz` is angular velocity in rad/s.
     /// Units are converted to mm/s and 0.001 rad/s with `i16` saturation.
+    /// A zero command also cancels the speed keep-alive.
     pub fn set_velocity_direct(&mut self, vx_m_s: f64, wz_rad_s: f64) -> Result<()> {
         let vx_mm_s = (vx_m_s * 1000.0) as i16;
         let wz_milli_rad_s = (wz_rad_s * 1000.0) as i16;
-        self.transport
-            .send(&frame_control_velocity(vx_mm_s, wz_milli_rad_s))
-            .context("failed to send velocity frame")
+        let frame = frame_control_velocity(vx_mm_s, wz_milli_rad_s);
+        self.last_speed_frame = (vx_mm_s != 0 || wz_milli_rad_s != 0).then_some(frame.clone());
+        self.transport.send(&frame).context("failed to send velocity frame")
     }
 
     /// Set left/right wheel speeds in mm/s (`0x21` frame).
+    ///
+    /// A zero command also cancels the speed keep-alive.
     pub fn set_wheel_speeds_mm_s(&mut self, left_mm_s: i16, right_mm_s: i16) -> Result<()> {
+        let frame = frame_control_wheel_speeds(left_mm_s, right_mm_s);
+        self.last_speed_frame = (left_mm_s != 0 || right_mm_s != 0).then_some(frame.clone());
         self.transport
-            .send(&frame_control_wheel_speeds(left_mm_s, right_mm_s))
+            .send(&frame)
             .context("failed to send wheel speed frame")
     }
 
@@ -171,9 +203,11 @@ mod tests {
         frame[3] = crate::frame::CMD_STATE_FEEDBACK;
         frame[4] = 1;
         frame[5] = 100;
-        frame[6..8].copy_from_slice(&300u16.to_be_bytes());
+        frame[6..8].copy_from_slice(&300u16.to_le_bytes());
         frame[12..14].copy_from_slice(&vx_mm_s.to_le_bytes());
         frame[14..16].copy_from_slice(&wz_milli_rad_s.to_le_bytes());
+        let sum = crate::frame::checksum(&frame[..crate::frame::STATE_FRAME_LEN - 2]);
+        frame[24..26].copy_from_slice(&sum.to_le_bytes());
         frame
     }
 
@@ -257,5 +291,64 @@ mod tests {
         assert_eq!(state.vx_mm_s, 1000);
         assert_eq!(state.wz_milli_rad_s, 200);
         assert_eq!(chassis.state().unwrap().battery_percentage, 100);
+    }
+
+    #[test]
+    fn keep_alive_resends_last_speed_command() {
+        let t = LoopbackTransport::new();
+        let mut chassis = Chassis::new(t);
+
+        // before any speed command only the upload enable is re-sent
+        chassis.keep_alive().unwrap();
+        assert_eq!(
+            chassis.transport.sent_frames(),
+            vec![crate::frame::frame_enable_states_upload(true)]
+        );
+
+        // after a non-zero velocity, the keep-alive re-sends it
+        chassis.set_velocity(0.2, 0.0).unwrap();
+        chassis.keep_alive().unwrap();
+        let frames = chassis.transport.sent_frames();
+        // keep_alive sends the upload enable first, then the speed frame
+        assert_eq!(
+            frames[frames.len() - 2],
+            crate::frame::frame_enable_states_upload(true)
+        );
+        assert_eq!(frames.last().unwrap(), &crate::frame::frame_control_velocity(200, 0));
+
+        // after stop the speed keep-alive is cancelled
+        chassis.stop().unwrap();
+        chassis.keep_alive().unwrap();
+        let frames = chassis.transport.sent_frames();
+        assert_eq!(frames.last().unwrap(), &crate::frame::frame_enable_states_upload(true));
+    }
+
+    #[test]
+    fn keep_alive_resends_wheel_speeds_in_wheel_mode() {
+        let t = LoopbackTransport::new();
+        let mut chassis = Chassis::new(t).with_control_mode(ControlMode::WheelSpeeds);
+        chassis.set_velocity(0.0, 0.5).unwrap();
+        chassis.keep_alive().unwrap();
+        let frames = chassis.transport.sent_frames();
+        assert_eq!(
+            frames.last().unwrap(),
+            &crate::frame::frame_control_wheel_speeds(-87, 87)
+        );
+    }
+
+    #[test]
+    fn emergency_stop_sends_0x22_frame() {
+        let t = LoopbackTransport::new();
+        let mut chassis = Chassis::new(t);
+        chassis.set_emergency_stop(true).unwrap();
+        assert_eq!(
+            chassis.transport.sent_frames().last().unwrap(),
+            &crate::frame::frame_emergency_stop(true)
+        );
+        chassis.set_emergency_stop(false).unwrap();
+        assert_eq!(
+            chassis.transport.sent_frames().last().unwrap(),
+            &crate::frame::frame_emergency_stop(false)
+        );
     }
 }
