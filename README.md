@@ -42,7 +42,7 @@ chassis-driver --mode serial --serial-port /dev/ttyACM0 status
 # Wheel-speed mode (host-side differential solve)
 chassis-driver --mode udp --ctrl-mode wheel-speeds vel 0.2 0.5
 
-# Continuous state reporting + keep-alive (default 50 ms tick)
+# Continuous state reporting + keep-alive (default 200 ms tick)
 chassis-driver --mode udp watch
 
 # Interactive shell (run `status`, `vel <vx> <wz>`, `vel2 <L> <R>`, `stop`, `quit`)
@@ -53,15 +53,18 @@ chassis-driver --mode udp
 
 The chassis zeroes the current speed 800 ms after the last speed control
 frame (protocol §3.6), so while moving, the driver re-sends the current
-velocity command on every 50 ms tick. `vel` / `vel2` either auto-stop after
+velocity command on every 200 ms tick. `vel` / `vel2` either auto-stop after
 a duration, or keep the process alive until Ctrl+C:
 
 ```sh
 # move for 2 seconds, then stop automatically
 chassis-driver --mode udp vel 0.2 0.0 --duration 2
 
-# keep moving (speed command re-asserted every 50 ms), stop on Ctrl+C
+# keep moving (speed command re-asserted every 200 ms), stop on Ctrl+C
 chassis-driver --mode udp vel 0.1 0.0
+
+# print the measured chassis state on every tick while moving (diagnostics)
+chassis-driver --mode serial vel 0.12 0.0 --duration 4 --report
 ```
 
 Safety guarantees:
@@ -96,7 +99,35 @@ State feedback (`0x80`, 26 bytes): `control_mode`, `battery_percentage`,
 little endian (protocol §3.2); received frames are validated against header,
 length byte and checksum (protocol §3.5).
 
-## Control modes
+Because the chassis streams a state report every 20 ms (50 Hz), the serial
+transport does **not** wait for the stream to go idle: it parses one complete
+frame out of the byte stream as soon as it arrives and buffers any leftover
+bytes for the next read.
+
+### Control mode & remote controller
+
+`control_mode` tells you who is in charge:
+
+| Value | Meaning | Serial velocity commands |
+| --- | --- | --- |
+| `0` | idle | accepted |
+| `1` | remote controller in control | **ignored** |
+| `2` | serial control | accepted |
+| `3` | external control | accepted |
+
+On this chassis the remote controller must be powered on and left in a mode
+that allows serial control, otherwise the chassis reports `control_mode=1` and
+ignores serial velocity commands. The driver prints a warning whenever it sees
+`control_mode=1`, and `status`/`watch`/`--report` also surface the state
+`flags`:
+
+- bit0 emergency-stop button, bit1 remote e-stop, bit2 software e-stop,
+  bit3 remote link lost, bit4 front bumper, bit5 rear bumper, bit6 charging.
+- Any emergency-stop bit set blocks movement; bit1 (remote e-stop) can only be
+  released on the remote controller itself.
+- `error_flags`: bit0 driver offline, bit1 driver alarm.
+
+## Command modes
 
 - **Velocity (default)**: `linear.x * 1000` and `angular.z * 1000` are sent
   as-is (`0x20`); the chassis controller solves the wheel speeds internally.
@@ -104,9 +135,10 @@ length byte and checksum (protocol §3.5).
   `vL = vx - ω·B/2`, `vR = vx + ω·B/2` with wheel base `B = 348 mm` and sends
   the result (`0x21`).
 
-The state upload command and the current speed command are re-sent on every
-tick as a keep-alive; the chassis drops the upload when the command is not
-repeated, and zeroes the speed 800 ms after the last speed frame (§3.6).
+The current speed command is re-sent on every tick as a keep-alive, and the
+state-upload enable is re-asserted occasionally (the chassis keeps the upload
+running for a while after the last enable frame); the chassis zeroes the speed
+800 ms after the last speed frame (§3.6).
 
 ## Safety
 

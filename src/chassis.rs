@@ -25,12 +25,17 @@ use crate::transport::Transport;
 pub const BASE_WIDTH_MM: f64 = 348.0;
 
 /// Milliseconds between the reference driver's keep-alive ticks.
-pub const DEFAULT_TICK_MS: u64 = 50;
+pub const DEFAULT_TICK_MS: u64 = 200;
 
 /// Milliseconds after which the chassis zeroes the current speed when no new
 /// speed control frame arrives (protocol §3.6). The driver must re-send the
 /// last speed command on every tick, well below this limit.
 pub const SPEED_TIMEOUT_MS: u64 = 800;
+
+/// Every this many ticks the state-upload enable is re-asserted. Re-sending it
+/// on every tick interferes with speed holding on this chassis, so it is only
+/// repeated occasionally to keep the 20 ms state upload alive on long runs.
+pub const UPLOAD_REASSERT_TICKS: u64 = 10;
 
 /// Control mode of the chassis.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -52,6 +57,8 @@ pub struct Chassis<T: Transport> {
     /// every [`Self::keep_alive`] tick because the chassis zeroes the speed
     /// [`SPEED_TIMEOUT_MS`] ms after the last speed frame (§3.6).
     last_speed_frame: Option<Vec<u8>>,
+    /// Tick counter, used to rate-limit the state-upload enable re-assertion.
+    ticks: u64,
 }
 
 impl<T: Transport> Chassis<T> {
@@ -63,6 +70,7 @@ impl<T: Transport> Chassis<T> {
             base_width_mm: BASE_WIDTH_MM,
             state: None,
             last_speed_frame: None,
+            ticks: 0,
         }
     }
 
@@ -99,11 +107,16 @@ impl<T: Transport> Chassis<T> {
         Ok(())
     }
 
-    /// Keep-alive: re-assert state upload and re-send the last non-zero speed
-    /// command (the chassis drops the upload and zeroes the speed after
-    /// [`SPEED_TIMEOUT_MS`] ms of silence, protocol §3.6).
+    /// Keep-alive: re-send the last non-zero speed command (the chassis
+    /// zeroes the speed [`SPEED_TIMEOUT_MS`] ms after the last speed frame,
+    /// protocol §3.6). The state-upload enable is re-asserted only every
+    /// [`UPLOAD_REASSERT_TICKS`] ticks: sending it on every tick interferes
+    /// with speed holding on this chassis.
     pub fn keep_alive(&mut self) -> Result<()> {
-        self.enable_states_upload(true)?;
+        self.ticks = self.ticks.wrapping_add(1);
+        if self.ticks % UPLOAD_REASSERT_TICKS == 0 {
+            self.enable_states_upload(true)?;
+        }
         if let Some(frame) = self.last_speed_frame.clone() {
             self.transport
                 .send(&frame)
@@ -298,29 +311,57 @@ mod tests {
         let t = LoopbackTransport::new();
         let mut chassis = Chassis::new(t);
 
-        // before any speed command only the upload enable is re-sent
+        // before any speed command nothing is sent
         chassis.keep_alive().unwrap();
-        assert_eq!(
-            chassis.transport.sent_frames(),
-            vec![crate::frame::frame_enable_states_upload(true)]
-        );
+        assert!(chassis.transport.sent_frames().is_empty());
 
         // after a non-zero velocity, the keep-alive re-sends it
         chassis.set_velocity(0.2, 0.0).unwrap();
         chassis.keep_alive().unwrap();
-        let frames = chassis.transport.sent_frames();
-        // keep_alive sends the upload enable first, then the speed frame
         assert_eq!(
-            frames[frames.len() - 2],
-            crate::frame::frame_enable_states_upload(true)
+            chassis.transport.sent_frames().last().unwrap(),
+            &crate::frame::frame_control_velocity(200, 0)
         );
-        assert_eq!(frames.last().unwrap(), &crate::frame::frame_control_velocity(200, 0));
 
         // after stop the speed keep-alive is cancelled
         chassis.stop().unwrap();
         chassis.keep_alive().unwrap();
         let frames = chassis.transport.sent_frames();
-        assert_eq!(frames.last().unwrap(), &crate::frame::frame_enable_states_upload(true));
+        assert_eq!(
+            frames.last().unwrap(),
+            &crate::frame::frame_control_velocity(0, 0)
+        );
+    }
+
+    #[test]
+    fn keep_alive_reasserts_upload_only_periodically() {
+        let t = LoopbackTransport::new();
+        let mut chassis = Chassis::new(t);
+        chassis.set_velocity(0.2, 0.0).unwrap();
+
+        // first UPLOAD_REASSERT_TICKS - 1 ticks: speed only, no enable frame
+        for _ in 0..UPLOAD_REASSERT_TICKS - 1 {
+            chassis.keep_alive().unwrap();
+        }
+        let frames = chassis.transport.sent_frames();
+        assert!(
+            !frames
+                .iter()
+                .any(|f| f == &crate::frame::frame_enable_states_upload(true))
+        );
+        assert_eq!(
+            frames.last().unwrap(),
+            &crate::frame::frame_control_velocity(200, 0)
+        );
+
+        // the UPLOAD_REASSERT_TICKS-th tick re-asserts the upload enable
+        chassis.keep_alive().unwrap();
+        let frames = chassis.transport.sent_frames();
+        assert_eq!(
+            frames[frames.len() - 2],
+            crate::frame::frame_enable_states_upload(true)
+        );
+        assert_eq!(frames.last().unwrap(), &crate::frame::frame_control_velocity(200, 0));
     }
 
     #[test]

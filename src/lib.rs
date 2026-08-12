@@ -36,7 +36,7 @@ pub mod transport;
 pub use chassis::{
     BASE_WIDTH_MM, Chassis, ControlMode, DEFAULT_TICK_MS, SPEED_TIMEOUT_MS,
 };
-pub use frame::ChassisState;
+pub use frame::{error_flags, flags, ChassisState};
 pub use transport::{
     DEFAULT_SERIAL_BAUD, DEFAULT_SERIAL_PORT, DEFAULT_UDP_IP, DEFAULT_UDP_PORT, SerialTransport,
     Transport, UdpTransport,

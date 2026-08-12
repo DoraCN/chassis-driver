@@ -128,6 +128,9 @@ enum Command {
         /// Auto-stop after this many seconds.
         #[arg(long)]
         duration: Option<f64>,
+        /// Print the measured chassis state on every tick while moving.
+        #[arg(long)]
+        report: bool,
     },
     /// Set left/right wheel speeds in mm/s directly (mode 2).
     Vel2 {
@@ -136,8 +139,11 @@ enum Command {
         /// Auto-stop after this many seconds.
         #[arg(long)]
         duration: Option<f64>,
+        /// Print the measured chassis state on every tick while moving.
+        #[arg(long)]
+        report: bool,
     },
-    /// Print chassis state every <ms> (default 50) and keep the upload alive.
+    /// Print chassis state every <ms> (default 200) and keep the upload alive.
     Watch { ms: Option<u64> },
 
     /// Listen only: print every byte received without sending anything.
@@ -179,12 +185,56 @@ fn print_state(state: &chassis_driver::ChassisState) {
         state.left_mm_s,
         state.right_mm_s,
     );
+    if state.emergency_stop() {
+        eprintln!("WARNING: emergency stop active — velocity commands are ignored");
+        if state.e_stop_button() {
+            eprintln!("  - chassis e-stop button is pressed");
+        }
+        if state.remote_emergency_stop() {
+            eprintln!("  - remote controller e-stop is engaged");
+        }
+        if state.software_emergency_stop() {
+            eprintln!("  - software e-stop is active (send 0x22 cancel to release)");
+        }
+    }
+    if state.control_mode == 1 {
+        eprintln!(
+            "WARNING: remote controller is in control (control_mode=1) — serial velocity commands are ignored"
+        );
+    }
+    if state.remote_lost() {
+        eprintln!("WARNING: remote controller link lost");
+    }
+    if state.bumper_triggered() {
+        eprintln!("WARNING: collision bumper triggered (send 0x23 clear to reset)");
+    }
+    if state.driver_fault() {
+        eprintln!(
+            "ERROR: motor driver {} (send 0x24 clear to reset)",
+            if state.error_flags & chassis_driver::error_flags::DRIVER_OFFLINE != 0 {
+                "offline"
+            } else {
+                "alarm"
+            }
+        );
+    }
 }
 
 fn read_once(chassis: &mut Chassis<Box<dyn Transport>>) -> Result<()> {
     match chassis.poll_state()? {
         Some(state) => print_state(&state),
         None => println!("status: <no reply>"),
+    }
+    Ok(())
+}
+
+/// Read one state report and warn if anything would block motion (e-stop,
+/// bumper, driver fault). Does not fail the move — the chassis decides.
+fn warn_if_blocked(chassis: &mut Chassis<Box<dyn Transport>>) -> Result<()> {
+    if let Some(state) = chassis.poll_state()? {
+        if state.emergency_stop() || state.bumper_triggered() || state.driver_fault() {
+            print_state(&state);
+        }
     }
     Ok(())
 }
@@ -325,7 +375,8 @@ fn main() -> Result<()> {
     match &cli.command {
         Some(Command::Init) => {}
         Some(Command::Status) => read_once(&mut chassis)?,
-        Some(Command::Vel { vx, wz, duration }) => {
+        Some(Command::Vel { vx, wz, duration, report }) => {
+            warn_if_blocked(&mut chassis)?;
             chassis.set_velocity(*vx, *wz)?;
             println!("set velocity: vx={vx} m/s, wz={wz} rad/s");
             // zero velocity means stop: nothing to keep alive
@@ -333,23 +384,25 @@ fn main() -> Result<()> {
                 return Ok(());
             }
             match duration {
-                Some(secs) => move_for_duration(&mut chassis, *secs)?,
-                None => keep_moving_until_ctrl_c(&mut chassis)?,
+                Some(secs) => move_for_duration(&mut chassis, *secs, *report)?,
+                None => keep_moving_until_ctrl_c(&mut chassis, *report)?,
             }
         }
         Some(Command::Vel2 {
             left,
             right,
             duration,
+            report,
         }) => {
+            warn_if_blocked(&mut chassis)?;
             chassis.set_wheel_speeds_mm_s(*left, *right)?;
             println!("set wheel speeds: L={left} mm/s, R={right} mm/s");
             if *left == 0 && *right == 0 {
                 return Ok(());
             }
             match duration {
-                Some(secs) => move_for_duration(&mut chassis, *secs)?,
-                None => keep_moving_until_ctrl_c(&mut chassis)?,
+                Some(secs) => move_for_duration(&mut chassis, *secs, *report)?,
+                None => keep_moving_until_ctrl_c(&mut chassis, *report)?,
             }
         }
         Some(Command::Watch { ms }) => {
@@ -385,12 +438,18 @@ fn install_ctrl_c_handler() -> Result<()> {
 /// Keep the chassis moving until Ctrl+C: the chassis zeroes the speed
 /// [`chassis_driver::SPEED_TIMEOUT_MS`] ms after the last speed frame
 /// (protocol §3.6), so the current speed command is re-asserted on every
-/// tick.
-fn keep_moving_until_ctrl_c(chassis: &mut Chassis<Box<dyn Transport>>) -> Result<()> {
+/// tick. With `report` set, the measured state is printed on each tick.
+fn keep_moving_until_ctrl_c(
+    chassis: &mut Chassis<Box<dyn Transport>>,
+    report: bool,
+) -> Result<()> {
     println!("chassis moving. Press Ctrl+C to stop.");
     install_ctrl_c_handler()?;
     while !STOPPED.load(std::sync::atomic::Ordering::Relaxed) {
         chassis.keep_alive()?;
+        if report {
+            report_tick(chassis)?;
+        }
         std::thread::sleep(std::time::Duration::from_millis(chassis_driver::DEFAULT_TICK_MS));
     }
     chassis.stop()?;
@@ -401,16 +460,32 @@ fn keep_moving_until_ctrl_c(chassis: &mut Chassis<Box<dyn Transport>>) -> Result
 /// Keep the chassis moving for `secs` seconds, re-asserting the current
 /// speed on every tick (the chassis zeroes the speed
 /// [`chassis_driver::SPEED_TIMEOUT_MS`] ms after the last speed frame,
-/// protocol §3.6), then stop.
-fn move_for_duration(chassis: &mut Chassis<Box<dyn Transport>>, secs: f64) -> Result<()> {
+/// protocol §3.6), then stop. With `report` set, the measured state is
+/// printed on each tick.
+fn move_for_duration(
+    chassis: &mut Chassis<Box<dyn Transport>>,
+    secs: f64,
+    report: bool,
+) -> Result<()> {
     println!("moving for {secs}s, then auto-stop");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs_f64(secs);
     while std::time::Instant::now() < deadline {
         chassis.keep_alive()?;
+        if report {
+            report_tick(chassis)?;
+        }
         std::thread::sleep(std::time::Duration::from_millis(chassis_driver::DEFAULT_TICK_MS));
     }
     chassis.stop()?;
     println!("stopped");
+    Ok(())
+}
+
+/// Poll one state report and print it in a compact one-line form.
+fn report_tick(chassis: &mut Chassis<Box<dyn Transport>>) -> Result<()> {
+    if let Some(state) = chassis.poll_state()? {
+        print_state(&state);
+    }
     Ok(())
 }
 

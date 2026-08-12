@@ -118,6 +118,72 @@ pub struct ChassisState {
     pub right_mm_s: i16,
 }
 
+/// Bit masks for [`ChassisState::flags`] (protocol §4.1.3).
+pub mod flags {
+    /// bit0: 急停按钮 — physical e-stop button on the chassis.
+    pub const E_STOP_BUTTON: u16 = 0x0001;
+    /// bit1: 遥控急停 — e-stop engaged on the remote controller.
+    pub const REMOTE_E_STOP: u16 = 0x0002;
+    /// bit2: 软件急停 — e-stop set over serial (`0x22`).
+    pub const SOFTWARE_E_STOP: u16 = 0x0004;
+    /// bit3: 遥控掉线 — remote controller link lost.
+    pub const REMOTE_LOST: u16 = 0x0008;
+    /// bit4: 前防撞杆触发 — front bumper triggered.
+    pub const FRONT_BUMPER: u16 = 0x0010;
+    /// bit5: 后防撞杆触发 — rear bumper triggered.
+    pub const REAR_BUMPER: u16 = 0x0020;
+    /// bit6: 回充开启 — charging engaged.
+    pub const CHARGING: u16 = 0x0040;
+}
+
+/// Bit masks for [`ChassisState::error_flags`] (protocol §4.1.3).
+pub mod error_flags {
+    /// bit0: 驱动器掉线 — a motor driver dropped off the bus.
+    pub const DRIVER_OFFLINE: u16 = 0x0001;
+    /// bit1: 驱动器报警 — a motor driver reported an alarm.
+    pub const DRIVER_ALARM: u16 = 0x0002;
+}
+
+impl ChassisState {
+    /// True while any emergency stop is engaged (button, remote, or software).
+    /// The chassis refuses velocity commands in this state.
+    pub fn emergency_stop(&self) -> bool {
+        self.flags & (flags::E_STOP_BUTTON | flags::REMOTE_E_STOP | flags::SOFTWARE_E_STOP) != 0
+    }
+
+    /// True while the physical e-stop button on the chassis is pressed.
+    pub fn e_stop_button(&self) -> bool {
+        self.flags & flags::E_STOP_BUTTON != 0
+    }
+
+    /// True while the remote controller's e-stop is engaged.
+    pub fn remote_emergency_stop(&self) -> bool {
+        self.flags & flags::REMOTE_E_STOP != 0
+    }
+
+    /// True while the software e-stop (`0x22`) is active.
+    pub fn software_emergency_stop(&self) -> bool {
+        self.flags & flags::SOFTWARE_E_STOP != 0
+    }
+
+    /// True while the remote controller link is lost.
+    pub fn remote_lost(&self) -> bool {
+        self.flags & flags::REMOTE_LOST != 0
+    }
+
+    /// True while a collision bumper is triggered.
+    pub fn bumper_triggered(&self) -> bool {
+        self.flags & (flags::FRONT_BUMPER | flags::REAR_BUMPER) != 0
+    }
+
+    /// True while a motor driver is offline or in alarm.
+    pub fn driver_fault(&self) -> bool {
+        self.error_flags
+            & (error_flags::DRIVER_OFFLINE | error_flags::DRIVER_ALARM)
+            != 0
+    }
+}
+
 /// Check whether `frame` looks like a chassis state feedback frame.
 ///
 /// Requires the frame header, the length byte `0x1A`, `Cmd == 0x80` and a
@@ -358,6 +424,62 @@ mod tests {
         let mut with_upload = frame.clone();
         with_upload.extend_from_slice(&frame);
         assert_eq!(extract_frame(&with_upload).expect("upload frame"), &frame[..]);
+    }
+
+    #[test]
+    fn state_flag_interpretation() {
+        let mut frame = vec![0u8; STATE_FRAME_LEN];
+        frame[0] = HEADER as u8;
+        frame[1] = (HEADER >> 8) as u8;
+        frame[2] = STATE_FRAME_LEN as u8;
+        frame[3] = CMD_STATE_FEEDBACK;
+        let mut seal = |frame: &mut Vec<u8>| {
+            let sum = checksum(&frame[..STATE_FRAME_LEN - 2]);
+            frame[24..26].copy_from_slice(&sum.to_le_bytes());
+        };
+        let decode = |frame: &Vec<u8>| decode_state(frame).expect("state frame");
+
+        // all clear
+        seal(&mut frame);
+        let state = decode(&frame);
+        assert!(!state.emergency_stop());
+        assert!(!state.driver_fault());
+        assert!(!state.bumper_triggered());
+
+        // remote e-stop alone
+        frame[8] = flags::REMOTE_E_STOP as u8;
+        seal(&mut frame);
+        let state = decode(&frame);
+        assert!(state.emergency_stop());
+        assert!(state.remote_emergency_stop());
+        assert!(!state.e_stop_button());
+        assert!(!state.software_emergency_stop());
+
+        // software + button e-stop
+        frame[8] = (flags::E_STOP_BUTTON | flags::SOFTWARE_E_STOP) as u8;
+        seal(&mut frame);
+        let state = decode(&frame);
+        assert!(state.emergency_stop());
+        assert!(state.e_stop_button());
+        assert!(state.software_emergency_stop());
+
+        // remote lost, not e-stop
+        frame[8] = flags::REMOTE_LOST as u8;
+        seal(&mut frame);
+        let state = decode(&frame);
+        assert!(!state.emergency_stop());
+        assert!(state.remote_lost());
+
+        // bumper
+        frame[8] = (flags::FRONT_BUMPER | flags::REAR_BUMPER) as u8;
+        seal(&mut frame);
+        assert!(decode(&frame).bumper_triggered());
+
+        // driver fault in the error word
+        frame[8] = 0;
+        frame[10] = (error_flags::DRIVER_OFFLINE | error_flags::DRIVER_ALARM) as u8;
+        seal(&mut frame);
+        assert!(decode(&frame).driver_fault());
     }
 
     #[test]
