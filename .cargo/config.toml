@@ -1,0 +1,13 @@
+# Cross-compilation support for the Jetson Orin (aarch64).
+#
+# To use: install an aarch64 Linux toolchain, e.g. via Homebrew:
+#   brew install aarch64-unknown-linux-gnu  (macOS)
+# then build with:
+#   cargo build --release --target aarch64-unknown-linux-gnu
+#
+# Note: `serialport` links against libudev on Linux. Cross builds need a
+# sysroot that provides it (PKG_CONFIG_SYSROOT_DIR / PKG_CONFIG_PATH).
+# The simplest path is to build directly on the Jetson:
+#   cargo build --release
+[target.aarch64-unknown-linux-gnu]
+linker = "aarch64-linux-gnu-gcc"

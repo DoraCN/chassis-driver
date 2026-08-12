@@ -1,0 +1,14 @@
+[package]
+name = "chassis-driver"
+version = "0.1.0"
+edition = "2024"
+description = "Driver for the ADORA A2 Pro / A2 Max differential chassis over serial or UDP"
+license = "MIT"
+repository = "https://github.com/DoraCN/chassis-driver"
+keywords = ["chassis", "differential", "motor", "adora", "robot"]
+categories = ["embedded", "hardware-support", "network-programming"]
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.6", features = ["derive"] }
+serialport = "4.9.0"
