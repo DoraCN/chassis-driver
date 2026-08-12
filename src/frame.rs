@@ -140,6 +140,28 @@ pub fn checksum_valid(frame: &[u8]) -> bool {
     }
 }
 
+/// Try to extract one complete, checksum-valid frame from a byte stream.
+///
+/// Scans for a frame header, then validates the length byte and trailing
+/// checksum. Returns the first valid frame; `None` if the buffer holds only a
+/// partial or invalid frame. Because the chassis streams state reports at
+/// 50 Hz, transports must not wait for the stream to idle — they should hand
+/// each complete frame to the caller as soon as it appears and keep any
+/// leftover bytes buffered for the next call.
+pub fn extract_frame(data: &[u8]) -> Option<&[u8]> {
+    let mut i = 0;
+    while i + 2 < data.len() {
+        if data[i] == HEADER as u8 && data[i + 1] == (HEADER >> 8) as u8 {
+            let len = data[i + 2] as usize;
+            if len >= 4 && i + len <= data.len() && checksum_valid(&data[i..i + len]) {
+                return Some(&data[i..i + len]);
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
 /// Decode a validated `0x80` state frame.
 ///
 /// All multi-byte fields are little endian per protocol §3.2; the expression
@@ -294,6 +316,48 @@ mod tests {
         let mut wrong_len = good.clone();
         wrong_len[2] = 0x1B;
         assert!(!is_state_frame(&wrong_len));
+    }
+
+    #[test]
+    fn extract_frame_finds_complete_frames_in_a_stream() {
+        let frame = frame_enable_states_upload(true);
+        let state = {
+            let mut f = vec![0u8; STATE_FRAME_LEN];
+            f[0] = HEADER as u8;
+            f[1] = (HEADER >> 8) as u8;
+            f[2] = STATE_FRAME_LEN as u8;
+            f[3] = CMD_STATE_FEEDBACK;
+            f[5] = 80;
+            let sum = checksum(&f[..STATE_FRAME_LEN - 2]);
+            f[24..26].copy_from_slice(&sum.to_le_bytes());
+            f
+        };
+
+        // two state frames back-to-back in one buffer
+        let mut stream = state.clone();
+        stream.extend_from_slice(&state);
+        let first = extract_frame(&stream).expect("first frame");
+        assert_eq!(first.len(), STATE_FRAME_LEN);
+        assert_eq!(first, &state[..]);
+        let rest = &stream[first.len()..];
+        assert_eq!(extract_frame(rest).expect("second frame"), &state[..]);
+
+        // frame straddling a split: bytes arrive in two chunks
+        let (a, b) = state.split_at(11);
+        let mut split = a.to_vec();
+        assert_eq!(extract_frame(&split), None, "partial frame not yet complete");
+        split.extend_from_slice(b);
+        assert_eq!(extract_frame(&split).expect("joined frame"), &state[..]);
+
+        // frame preceded by garbage bytes is still found
+        let mut noisy = vec![0x55, 0xAA, 0x00];
+        noisy.extend_from_slice(&state);
+        assert_eq!(extract_frame(&noisy).expect("frame after garbage"), &state[..]);
+
+        // enable-upload frame too
+        let mut with_upload = frame.clone();
+        with_upload.extend_from_slice(&frame);
+        assert_eq!(extract_frame(&with_upload).expect("upload frame"), &frame[..]);
     }
 
     #[test]

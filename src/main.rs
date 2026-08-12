@@ -333,12 +333,7 @@ fn main() -> Result<()> {
                 return Ok(());
             }
             match duration {
-                Some(secs) => {
-                    println!("moving for {secs}s, then auto-stop");
-                    std::thread::sleep(std::time::Duration::from_secs_f64(*secs));
-                    chassis.stop()?;
-                    println!("stopped");
-                }
+                Some(secs) => move_for_duration(&mut chassis, *secs)?,
                 None => keep_moving_until_ctrl_c(&mut chassis)?,
             }
         }
@@ -353,12 +348,7 @@ fn main() -> Result<()> {
                 return Ok(());
             }
             match duration {
-                Some(secs) => {
-                    println!("moving for {secs}s, then auto-stop");
-                    std::thread::sleep(std::time::Duration::from_secs_f64(*secs));
-                    chassis.stop()?;
-                    println!("stopped");
-                }
+                Some(secs) => move_for_duration(&mut chassis, *secs)?,
                 None => keep_moving_until_ctrl_c(&mut chassis)?,
             }
         }
@@ -400,6 +390,22 @@ fn keep_moving_until_ctrl_c(chassis: &mut Chassis<Box<dyn Transport>>) -> Result
     println!("chassis moving. Press Ctrl+C to stop.");
     install_ctrl_c_handler()?;
     while !STOPPED.load(std::sync::atomic::Ordering::Relaxed) {
+        chassis.keep_alive()?;
+        std::thread::sleep(std::time::Duration::from_millis(chassis_driver::DEFAULT_TICK_MS));
+    }
+    chassis.stop()?;
+    println!("stopped");
+    Ok(())
+}
+
+/// Keep the chassis moving for `secs` seconds, re-asserting the current
+/// speed on every tick (the chassis zeroes the speed
+/// [`chassis_driver::SPEED_TIMEOUT_MS`] ms after the last speed frame,
+/// protocol §3.6), then stop.
+fn move_for_duration(chassis: &mut Chassis<Box<dyn Transport>>, secs: f64) -> Result<()> {
+    println!("moving for {secs}s, then auto-stop");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs_f64(secs);
+    while std::time::Instant::now() < deadline {
         chassis.keep_alive()?;
         std::thread::sleep(std::time::Duration::from_millis(chassis_driver::DEFAULT_TICK_MS));
     }

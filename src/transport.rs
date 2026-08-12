@@ -48,6 +48,10 @@ impl<T: Transport + ?Sized> Transport for Box<T> {
 /// Serial (UART) transport.
 pub struct SerialTransport {
     port: Box<dyn serialport::SerialPort>,
+    /// Bytes read but not yet consumed by a complete frame (§3.4): the
+    /// chassis streams 26-byte state reports at 50 Hz, so a frame may straddle
+    /// two `read`s and several may arrive in one.
+    rx: Vec<u8>,
 }
 
 impl SerialTransport {
@@ -60,7 +64,10 @@ impl SerialTransport {
             .timeout(RECV_TIMEOUT)
             .open()
             .with_context(|| format!("failed to open serial port {port}"))?;
-        Ok(Self { port })
+        Ok(Self {
+            port,
+            rx: Vec::with_capacity(128),
+        })
     }
 }
 
@@ -73,18 +80,29 @@ impl Transport for SerialTransport {
     }
 
     fn recv(&mut self) -> Result<Option<Vec<u8>>> {
-        let mut buf = Vec::with_capacity(64);
+        if let Some(frame) = crate::frame::extract_frame(&self.rx) {
+            let frame = frame.to_vec();
+            let consumed = frame.len();
+            self.rx.drain(..consumed);
+            return Ok(Some(frame));
+        }
         let mut tmp = [0u8; 64];
         loop {
             match self.port.read(&mut tmp) {
-                Ok(0) => break,
-                Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                Ok(0) => {}
+                Ok(n) => self.rx.extend_from_slice(&tmp[..n]),
                 Err(e) if e.kind() == std::io::ErrorKind::TimedOut => break,
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                 Err(e) => return Err(e).context("failed to read from serial port"),
             }
+            if let Some(frame) = crate::frame::extract_frame(&self.rx) {
+                let frame = frame.to_vec();
+                let consumed = frame.len();
+                self.rx.drain(..consumed);
+                return Ok(Some(frame));
+            }
         }
-        Ok((!buf.is_empty()).then_some(buf))
+        Ok(None)
     }
 }
 
