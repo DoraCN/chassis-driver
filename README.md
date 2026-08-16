@@ -27,12 +27,27 @@ cargo add chassis_driver
 
 ### Serial permissions
 
-The serial device must be readable and writable by the current user. Create a
-udev rule (or add your user to the `dialout` group) instead of `chmod 777`:
+The serial device must be readable and writable by the current user, and its
+device name (`/dev/ttyACM0`, `/dev/ttyACM1`, ...) can change on every boot as
+USB devices are enumerated in an arbitrary order.
+
+Use the setup script to pick the chassis's device from a menu once; it writes a
+udev rule that pins the device to a stable name:
+
+```sh
+sudo scripts/setup-chassis-device.sh --list   # see what is connected
+sudo scripts/setup-chassis-device.sh          # choose the chassis device
+chassis-driver --serial-port /dev/chassis status
+```
+
+The script records the device's `idVendor`/`idProduct`/`serial` in
+`/etc/udev/rules.d/99-chassis.rules` and creates a fixed `/dev/chassis`
+symlink that no longer depends on the enumeration order. Alternatively, create
+the rule by hand (or add your user to the `dialout` group):
 
 ```sh
 # /etc/udev/rules.d/99-chassis.rules
-SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", MODE="0666"
+SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="55d3", ATTRS{serial}=="<serial>", SYMLINK+="chassis", MODE="0666"
 ```
 
 ## Usage
